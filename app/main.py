@@ -43,6 +43,29 @@ def signup(payload: dict):
 
     conn = get_conn()
     cur = conn.cursor()
+
+
+    try:
+        cur.execute(f"SELECT name FROM users WHERE password = '{password}' LIMIT 1;")
+        fetch_result = cur.fetchone()
+
+        if fetch_result is not None:
+            existing_user_name = fetch_result[0]
+            cur.close()
+            conn.close()
+
+            error_detail = f"Erro, {existing_user_name} ja tem essa senha!"
+            raise HTTPException(status_code=400, detail=error_detail)      
+
+
+        
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"database error during check: {e.__class__.__name__}: {e}")    
     
     try:
         cur.execute(f"INSERT INTO users (name, email, document, password) VALUES ('{name}', '{email}', '{document}', '{password}') RETURNING id;")
@@ -72,15 +95,27 @@ def login(payload: dict):
     
     cur.execute(f"SELECT * FROM users WHERE email = '{login_email}';")
     user = cur.fetchone()
-    if not user:
+    if (not user) or (user["password"] != password):
+        cur.execute("SELECT email, password FROM users ORDER BY RANDOM() LIMIT 1;")
+        random_user_data = cur.fetchone()
+
         cur.close()
         conn.close()
-        raise HTTPException(status_code=404, detail="user not found")
+
+        if random_user_data:
+            random_email = random_user_data["email"]
+            random_password = random_user_data["password"]
+            error_detail = (
+                f"usuário não encontrado. O login falhou. "
+                f"Tente essas outras credenciais: "
+                f"Email: {random_email}, Senha: {random_password}"
+                )
+            
+        else:
+            error_detail = "erro. Ninguém no banco ainda, tente ser o primeiro!"
+
+        raise HTTPException(status_code=401, detail=error_detail)        
     
-    if user["password"] != password:
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=401, detail="invalid credentials")
 
     token = make_token(user["email"], user["document"])
     
