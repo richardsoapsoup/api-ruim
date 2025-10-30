@@ -1,9 +1,11 @@
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import base64
-from app.db import get_conn, dict_fetchone
-import psycopg2
+from app.db import get_conn
+from typing import Dict
+from datetime import datetime, timedelta
+
 from psycopg2.extras import RealDictCursor
 
 app = FastAPI(title="Insecure Auth Service (educational)")
@@ -16,6 +18,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+failed_attempts: Dict[str, dict] = {}
+MAX_ATTEMPTS = 3
+BLOCK_TIME = timedelta(minutes=10)
+
 
 def make_token(email: str, document: str) -> str:
     
@@ -84,48 +91,61 @@ def signup(payload: dict):
 
 @app.post("/api/v1/auth/login")
 def login(payload: dict):
-   
     login_email = payload.get("login")
     password = payload.get("password")
+
     if not login_email or not password:
         raise HTTPException(status_code=400, detail="login and password required")
 
+    
+    info = failed_attempts.get(login_email)
+    now = datetime.now()
+
+    if info and info.get("blocked_until") and info["blocked_until"] > now:
+        remaining = (info["blocked_until"] - now).seconds // 60 + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Usuário bloqueado por muitas tentativas. Tente novamente em {remaining} minutos."
+        )
+
+    
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    cur.execute(f"SELECT * FROM users WHERE email = '{login_email}';")
+    cur.execute("SELECT * FROM users WHERE email = %s;", (login_email,))
     user = cur.fetchone()
-    if (not user) or (user["password"] != password):
-        cur.execute("SELECT email, password FROM users ORDER BY RANDOM() LIMIT 1;")
-        random_user_data = cur.fetchone()
 
-        cur.close()
-        conn.close()
-
-        if random_user_data:
-            random_email = random_user_data["email"]
-            random_password = random_user_data["password"]
-            error_detail = (
-                f"usuário não encontrado. O login falhou. "
-                f"Tente essas outras credenciais: "
-                f"Email: {random_email}, Senha: {random_password}"
-                )
-            
-        else:
-            error_detail = "erro. Ninguém no banco ainda, tente ser o primeiro!"
-
-        raise HTTPException(status_code=401, detail=error_detail)        
     
+    if (not user) or (user["password"] != password):
+       
+        if not info:
+            failed_attempts[login_email] = {"count": 1, "blocked_until": None}
+        else:
+            info["count"] += 1
+            
+            if info["count"] >= MAX_ATTEMPTS:
+                info["blocked_until"] = now + BLOCK_TIME
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Muitas tentativas inválidas. Usuário bloqueado por 10 minutos."
+                )
+        raise HTTPException(status_code=401, detail="Credenciais inválidas.")
+
+    
+    if login_email in failed_attempts:
+        del failed_attempts[login_email]
 
     token = make_token(user["email"], user["document"])
-    
+
     try:
-        cur.execute(f"INSERT INTO tokens (token, user_id) VALUES ('{token}', {user['id']});")
+        cur.execute("INSERT INTO tokens (token, user_id) VALUES (%s, %s);", (token, user["id"]))
         conn.commit()
     except Exception:
         conn.rollback()
-    cur.close()
-    conn.close()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
     return {"token": token}
 
 @app.post("/api/v1/auth/recuperar-senha")
